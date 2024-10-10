@@ -1,0 +1,70 @@
+name: "Container Image Builder on AWS"
+description: "A container image builder action for AWS ECR"
+author: "ardikabs"
+branding:
+  color: blue
+  icon: anchor
+
+inputs:
+  name:
+    description: The container image name.
+    required: true
+  context:
+    description: The context to be use during build. It defaults to the current working directory.
+    default: .
+  dockerfile:
+    description: Dockerfile path relative to the context. Default to '${context}/Dockerfile'.
+    default: Dockerfile
+  tag:
+    description: Tag to use for the container image
+    required: true
+  build-role:
+    description: "The AWS role to assume for building container. It could be in the form of github vars on env.AWS_BUILD_ROLE, otherwise it must be provided as input."
+    default: ""
+  region:
+    description: AWS region to use. It could be in the form of github vars on env.AWS_REGION, otherwise it must be provided as input.
+    default: ap-east-1
+  build-args:
+    description: List of build arguments to pass to the build. It should be in the form of key=value pairs split by comma.
+    required: false
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v2
+      with:
+        python-version: "3.7"
+
+    - name: Install AWS CLI
+      run: |
+        python -m pip install --upgrade pip
+        pip install awscli
+      shell: bash
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-region: ${{ env.AWS_REGION != '' && env.AWS_REGION || inputs.region }}
+        role-to-assume: ${{ env.AWS_BUILD_ROLE != '' && env.AWS_BUILD_ROLE || inputs.build-role }}
+        role-session-name: ECRBuild
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Set up Docker Context for Buildx
+      run: docker context create builders || true
+      shell: bash
+
+    - uses: docker/setup-buildx-action@v2
+      with:
+        endpoint: builders
+
+    - name: Build and push
+      uses: docker/build-push-action@v4
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.context }}/${{ inputs.dockerfile }}
+        tags: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.name }}:${{ inputs.tag }}
+        push: true
+        build-args: ${{ inputs.build-args }}
