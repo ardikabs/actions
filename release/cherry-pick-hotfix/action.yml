@@ -7,25 +7,30 @@ inputs:
     description: 'GitHub token with repo and workflow scopes (use secrets.PAT)'
     required: true
 
-  squash-sha:
-    description: 'The squash commit SHA from the merged PR'
-    required: true
-
   pr-number:
     description: 'The PR number that was merged'
     required: true
 
+  mode:
+    description: 'The mode to run: "hotfix" or "completed"'
+    required: false
+    default: 'hotfix'
+
+  squash-sha:
+    description: 'The squash commit SHA from the merged PR'
+    required: false
+
   pr-title:
     description: 'The title of the merged PR'
-    required: true
+    required: false
 
   pr-url:
     description: 'The URL of the merged PR'
-    required: true
+    required: false
 
   labels:
     description: 'JSON array of labels from the PR'
-    required: true
+    required: false
 
   dry-run:
     description: 'If true, simulate the cherry-pick without creating PR'
@@ -40,6 +45,14 @@ outputs:
   skipped-versions:
     description: 'JSON array of skipped versions due to missing branches'
     value: ${{ steps.cherry-pick.outputs.skipped-versions }}
+
+  labeled-prs:
+    description: 'JSON array of labeled PR numbers'
+    value: ${{ steps.cherry-pick.outputs.labeled-prs }}
+
+  accumulated-prs:
+    description: 'JSON array of accumulated PR numbers in the hotfix branch'
+    value: ${{ steps.cherry-pick.outputs.accumulated-prs }}
 
 runs:
   using: 'composite'
@@ -60,6 +73,7 @@ runs:
       shell: bash
       env:
         INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_MODE: ${{ inputs.mode }}
         INPUT_SQUASH_SHA: ${{ inputs.squash-sha }}
         INPUT_PR_NUMBER: ${{ inputs.pr-number }}
         INPUT_PR_TITLE: ${{ inputs.pr-title }}
@@ -67,14 +81,7 @@ runs:
         INPUT_LABELS: ${{ inputs.labels }}
         INPUT_DRY_RUN: ${{ inputs.dry-run }}
       run: |
-        python ${{ github.action_path }}/src/cherry_pick.py
-
-    - name: Output summary
-      shell: bash
-      run: |
-        if [ -f "${{ github.action_path }}/summary.txt" ]; then
-          cat ${{ github.action_path }}/summary.txt >> $GITHUB_STEP_SUMMARY
-        fi
+        python ${{ github.action_path }}/src/main.py
 
 branding:
   icon: 'git-branch'
