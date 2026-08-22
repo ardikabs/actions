@@ -1,0 +1,51 @@
+name: 'Cherry-Pick Completed'
+description: 'Add cherry-pick-completed label to original PRs when hotfix PR is merged'
+author: 'ardikabs'
+
+inputs:
+  github-token:
+    description: 'GitHub token with repo scope (use secrets.PAT)'
+    required: true
+
+  pr-number:
+    description: 'The merged hotfix PR number'
+    required: true
+
+outputs:
+  labeled-prs:
+    description: 'JSON array of labeled PR numbers'
+    value: ${{ steps.completed.outputs.labeled-prs }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r ${{ github.action_path }}/requirements.txt
+
+    - name: Run completed automation
+      id: completed
+      shell: bash
+      env:
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_PR_NUMBER: ${{ inputs.pr-number }}
+      run: |
+        python ${{ github.action_path }}/src/completed.py
+
+    - name: Output summary
+      shell: bash
+      run: |
+        if [ -f "${{ github.action_path }}/summary.txt" ]; then
+          cat ${{ github.action_path }}/summary.txt >> $GITHUB_STEP_SUMMARY
+        fi
+
+branding:
+  icon: 'tag'
+  color: 'green'

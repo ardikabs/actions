@@ -1,0 +1,81 @@
+name: 'Cherry-Pick Hotfix'
+description: 'Automatically cherry-pick merged PRs to maintenance branches based on labels'
+author: 'ardikabs'
+
+inputs:
+  github-token:
+    description: 'GitHub token with repo and workflow scopes (use secrets.PAT)'
+    required: true
+
+  squash-sha:
+    description: 'The squash commit SHA from the merged PR'
+    required: true
+
+  pr-number:
+    description: 'The PR number that was merged'
+    required: true
+
+  pr-title:
+    description: 'The title of the merged PR'
+    required: true
+
+  pr-url:
+    description: 'The URL of the merged PR'
+    required: true
+
+  labels:
+    description: 'JSON array of labels from the PR'
+    required: true
+
+  dry-run:
+    description: 'If true, simulate the cherry-pick without creating PR'
+    required: false
+    default: 'false'
+
+outputs:
+  created-prs:
+    description: 'JSON array of created PR URLs'
+    value: ${{ steps.cherry-pick.outputs.created-prs }}
+
+  skipped-versions:
+    description: 'JSON array of skipped versions due to missing branches'
+    value: ${{ steps.cherry-pick.outputs.skipped-versions }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r ${{ github.action_path }}/requirements.txt
+
+    - name: Run cherry-pick automation
+      id: cherry-pick
+      shell: bash
+      env:
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_SQUASH_SHA: ${{ inputs.squash-sha }}
+        INPUT_PR_NUMBER: ${{ inputs.pr-number }}
+        INPUT_PR_TITLE: ${{ inputs.pr-title }}
+        INPUT_PR_URL: ${{ inputs.pr-url }}
+        INPUT_LABELS: ${{ inputs.labels }}
+        INPUT_DRY_RUN: ${{ inputs.dry-run }}
+      run: |
+        python ${{ github.action_path }}/src/cherry_pick.py
+
+    - name: Output summary
+      shell: bash
+      run: |
+        if [ -f "${{ github.action_path }}/summary.txt" ]; then
+          cat ${{ github.action_path }}/summary.txt >> $GITHUB_STEP_SUMMARY
+        fi
+
+branding:
+  icon: 'git-branch'
+  color: 'blue'
