@@ -402,6 +402,56 @@ class CherryPickCompletedAutomation:
         self.gh = github.Github(config.github_token)
         self.gh_repo = self.gh.get_repo(os.environ.get('GITHUB_REPOSITORY', ''))
 
+    def parse_version_labels(self, pr) -> List[VersionTarget]:
+        version_pattern = re.compile(r'^cherry-pick/release-v?(\d+)\.(\d+)$')
+        versions = {}
+
+        for label in pr.labels:
+            match = version_pattern.match(label.name)
+            if match:
+                major, minor = int(match.group(1)), int(match.group(2))
+                key = f"{major}.{minor}"
+                versions[key] = VersionTarget(major=major, minor=minor)
+
+        return list(versions.values())
+
+    def add_completed_labels(self, pr, target_versions: List[VersionTarget]) -> List[str]:
+        added_labels = []
+        for target in target_versions:
+            label_name = f"cherry-pick-completed/v{target.version_string}"
+            try:
+                pr.add_to_labels(label_name)
+                added_labels.append(label_name)
+                print(f"Added label '{label_name}' to PR #{pr.number}")
+            except Exception as e:
+                print(f"Failed to add label '{label_name}' to PR #{pr.number}: {e}")
+        return added_labels
+
+    def check_and_add_generic_label(self, pr) -> bool:
+        version_pattern = re.compile(r'^cherry-pick/release-v?(\d+)\.(\d+)$')
+        completed_pattern = re.compile(r'^cherry-pick-completed/v(\d+)\.(\d+)$')
+
+        source_versions = set()
+        completed_versions = set()
+
+        for label in pr.labels:
+            version_match = version_pattern.match(label.name)
+            if version_match:
+                source_versions.add(f"{version_match.group(1)}.{version_match.group(2)}")
+
+            completed_match = completed_pattern.match(label.name)
+            if completed_match:
+                completed_versions.add(f"{completed_match.group(1)}.{completed_match.group(2)}")
+
+        if source_versions and source_versions == completed_versions:
+            try:
+                pr.add_to_labels('cherry-pick-completed')
+                print(f"Added generic label 'cherry-pick-completed' to PR #{pr.number} (all versions complete)")
+                return True
+            except Exception as e:
+                print(f"Failed to add generic label to PR #{pr.number}: {e}")
+        return False
+
     def run(self) -> List[int]:
         print(f"Fetching hotfix Pull Request #{self.config.pr_number}...")
         try:
