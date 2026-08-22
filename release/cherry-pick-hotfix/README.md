@@ -87,8 +87,7 @@ jobs:
       - name: Label Source PRs as Completed
         if: |
           github.event.pull_request.merged == true &&
-          startsWith(github.event.pull_request.base.ref, 'release/') &&
-          contains(github.event.pull_request.labels.*.name, 'cherry-pick')
+          startsWith(github.event.pull_request.base.ref, 'release/')
         uses: ardikabs/actions/release/cherry-pick-hotfix@main
         with:
           github-token: ${{ secrets.PAT }}

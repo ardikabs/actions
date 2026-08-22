@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import github
 from git import Repo
 from pydantic import BaseModel
-
+from jinja2 import Environment
 
 class CherryPickConfig(BaseModel):
     github_token: str
@@ -47,7 +47,7 @@ class HotfixResult:
     has_conflicts: bool = False
 
 
-class CherryPickAutomation:
+class CherryPickHotfixAutomation:
     def __init__(self, config: CherryPickConfig):
         self.config = config
         self.repo = Repo(os.getcwd())
@@ -127,8 +127,7 @@ class CherryPickAutomation:
 
     def cherry_pick_commit(self, sha: str) -> Tuple[bool, bool]:
         try:
-            self.repo.git.config('user.name', 'ardikabs')
-            self.repo.git.config('user.email', 'me@ardikabs.com')
+            # Identity is already configured in process_version()
             self.repo.git.cherry_pick(sha, '-x')
             return (True, False)
         except subprocess.CalledProcessError as e:
@@ -244,15 +243,25 @@ class CherryPickAutomation:
         hotfix_branch = f"hotfix/v{target.version_string}.x"
 
         try:
-            # Configure git user if not set
+            # Configure Git Identity first (Global for safety)
+            # We set it globally for the runner context to ensure all operations use it.
+            self.repo.config_writer().set_value("user", "name", "github-actions[bot]").release()
+            self.repo.config_writer().set_value("user", "email", "github-actions[bot]@users.noreply.github.com").release()
+
+            # Hard Reset to ensure no leftover files from previous steps
+            print("Ensuring clean working directory...")
+            self.repo.git.reset('--hard', 'HEAD')
+            self.repo.git.clean('-fd')
+
+            # Clear any stuck cherry-pick state from previous runs
             try:
-                self.repo.git.config('user.name')
-            except Exception:
-                self.repo.git.config('user.name', 'github-actions[bot]')
-            try:
-                self.repo.git.config('user.email')
-            except Exception:
-                self.repo.git.config('user.email', 'github-actions[bot]@users.noreply.github.com')
+                self.repo.git.cherry_pick('--abort')
+            except:
+                pass
+
+            # Ensure we are on 'main' (or a known baseline) before starting
+            # This prevents "already on branch" errors or unexpected states
+            self.repo.git.checkout('main')
 
             # Ensure branch exists on remote first, based on release branch (not main/HEAD)
             if not self.remote_branch_exists(hotfix_branch):
@@ -290,6 +299,7 @@ class CherryPickAutomation:
                         print(f"Push successful. Created new PR: {pr_url}")
 
                     self.repo.git.checkout('main')
+
                     return HotfixResult(
                         version=target,
                         success=True,
@@ -297,34 +307,68 @@ class CherryPickAutomation:
                         pr_number=pr_number
                     )
                 else:
+
                     self.repo.git.checkout('main')
+
                     return HotfixResult(
                         version=target,
                         success=False,
                         error="Failed to push cherry-picked commit to remote"
                     )
             else:
-                self.repo.git.checkout('main')
                 if has_conflicts:
+                    # Ensure a PR exists even if there are conflicts
+                    pr_body = self.generate_pr_body(target, release_branch, hotfix_branch)
+                    pr_body = (
+                        "## ⚠️ MERGE CONFLICTS DETECTED - MANUAL RESOLUTION REQUIRED\n\n"
+                        f"Commit `{short_sha}` could not be automatically cherry-picked into `{hotfix_branch}`.\n\n"
+                        "---\n\n"
+                        f"{pr_body}")
+
+                    pr = self.get_open_pull_request(hotfix_branch, release_branch)
+                    if not pr:
+                        print("Conflict detected. Creating draft PR for manual resolution...")
+                        pr_url, pr_number = self.create_pull_request(
+                            target,
+                            hotfix_branch,
+                            release_branch,
+                            pr_body)
+                    else:
+                        pr_url = pr.html_url
+                        pr_number = pr.number
+                        print(f"Conflict detected. Existing PR found: {pr_url}")
+
                     self.post_conflict_comment(target, hotfix_branch)
+
+                    # Abort the cherry-pick to release the lock/conflict state
+                    try:
+                        self.repo.git.cherry_pick('--abort')
+                    except:
+                        pass
+
+                    self.repo.git.checkout('main')
                     return HotfixResult(
                         version=target,
                         success=False,
                         error="Cherry-pick failed due to merge conflicts",
                         has_conflicts=True
                     )
+
+                try:
+                    self.repo.git.cherry_pick('--abort')
+                except:
+                    pass
+
+                self.repo.git.checkout('main')
                 return HotfixResult(
                     version=target,
                     success=False,
-                    error="Cherry-pick failed"
+                    error="Cherry-pick failed for unknown reason"
                 )
 
         except Exception as e:
-            try:
-                self.repo.git.checkout('main')
-            except:
-                pass
 
+            self.repo.git.checkout('main')
             return HotfixResult(
                 version=target,
                 success=False,
@@ -341,7 +385,8 @@ class CherryPickAutomation:
                 'skipped_versions': [],
                 'accumulated_prs': [],
                 'errors': [],
-                'has_labels': False
+                'has_labels': False,
+                'is_noop': True
             }
 
         results = []
@@ -383,6 +428,7 @@ class CherryPickAutomation:
             'skipped_versions': skipped_versions,
             'accumulated_prs': dedup_accumulated,
             'has_labels': True,
+            'is_noop': len(created_prs) == 0 and len(skipped_versions) > 0,
             'results': [
                 {
                     'version': r.version.version_string,
@@ -501,12 +547,23 @@ class CherryPickCompletedAutomation:
                         if pr.number == self.config.pr_number:
                             continue
 
-                        print(f"Found source PR #{pr.number}. Adding label 'cherry-pick-completed'...")
-                        try:
-                            pr.add_to_labels('cherry-pick-completed')
-                            labeled_prs.append(pr.number)
-                        except Exception as label_err:
-                            print(f"Failed to add label to PR #{pr.number}: {label_err}")
+                        print(f"Found source PR #{pr.number}. Processing labels...")
+
+                        target_versions = self.parse_version_labels(pr)
+                        if target_versions:
+                            print(f"Source PR has version labels: {[v.version_string for v in target_versions]}")
+
+                            self.add_completed_labels(pr, target_versions)
+
+                            self.check_and_add_generic_label(pr)
+                        else:
+                            print(f"No version labels found on source PR. Adding generic 'cherry-pick-completed'...")
+                            try:
+                                pr.add_to_labels('cherry-pick-completed')
+                            except Exception as label_err:
+                                print(f"Failed to add label to PR #{pr.number}: {label_err}")
+
+                        labeled_prs.append(pr.number)
                 else:
                     # Fallback search using search API if get_pulls is empty
                     print(f"No direct PR found for {sha[:7]} via get_pulls. Trying search API...")
@@ -517,12 +574,23 @@ class CherryPickCompletedAutomation:
                             pr = self.gh_repo.get_pull(issue.number)
                             if pr.number == self.config.pr_number:
                                 continue
-                            print(f"Found source PR #{pr.number} via search. Adding label...")
-                            try:
-                                pr.add_to_labels('cherry-pick-completed')
-                                labeled_prs.append(pr.number)
-                            except Exception as label_err:
-                                print(f"Failed to add label to PR #{pr.number}: {label_err}")
+                            print(f"Found source PR #{pr.number} via search. Processing labels...")
+
+                            target_versions = self.parse_version_labels(pr)
+                            if target_versions:
+                                print(f"Source PR has version labels: {[v.version_string for v in target_versions]}")
+
+                                self.add_completed_labels(pr, target_versions)
+
+                                self.check_and_add_generic_label(pr)
+                            else:
+                                print(f"No version labels found on source PR. Adding generic 'cherry-pick-completed'...")
+                                try:
+                                    pr.add_to_labels('cherry-pick-completed')
+                                except Exception as label_err:
+                                    print(f"Failed to add label to PR #{pr.number}: {label_err}")
+
+                            labeled_prs.append(pr.number)
                     else:
                         print(f"Could not associate commit {sha[:7]} with any Pull Request.")
             except Exception as e:
@@ -532,8 +600,76 @@ class CherryPickCompletedAutomation:
         return sorted(list(set(labeled_prs)))
 
 
+def check_and_exit(results: dict) -> None:
+    if results.get('is_noop', False):
+        print("💡 No-op: No PRs were created (all versions were skipped).", file=sys.stderr)
+        sys.exit(0)
+    if results.get('has_labels') and not results.get('created_prs'):
+        print("❌ Error: Labels were found but no PRs were created.", file=sys.stderr)
+        sys.exit(1)
+
+
+def generate_summary(config, results=None, labeled_prs=None) -> str:
+    env = Environment(trim_blocks=True, lstrip_blocks=True)
+    if config.mode == 'hotfix':
+        template_str="""\
+## 🍒 Hotfix Cherry-Pick Summary
+
+Processed hotfix cherry-pick from PR #{{ config.pr_number }}
+
+**Squash commit**: `{{ config.squash_sha[:7] }}`
+
+{% if results.created_prs %}
+### ✅ Created/Updated Hotfix PRs
+
+{% for pr in results.created_prs %}
+- v{{ pr.version }}: [PR #{{ pr.number }}]({{ pr.url }})
+{% endfor %}
+{% endif %}
+{% if results.accumulated_prs %}
+### 📋 Accumulated PRs in Hotfix Branch
+
+{% for pr_num in results.accumulated_prs %}
+- #{{ pr_num }}
+{% endfor %}
+{% endif %}
+{% if results.skipped_versions %}
+### ⚠️ Skipped Versions
+
+{% for skip in results.skipped_versions %}
+- v{{ skip.version }}: {{ skip.reason }}
+{% endfor %}
+{% endif %}
+"""
+        template = env.from_string(template_str)
+        return template.render(config=config, results=results)
+
+    elif config.mode == 'completed':
+        template_str = """\
+## 🏷️ Cherry-Pick Completed Labeler Summary
+
+Processed hotfix PR #{{ config.pr_number }}
+
+{% if labeled_prs %}
+### ✅ Labeled Pull Requests
+
+{% for pr_num in labeled_prs %}
+- PR #{{ pr_num }} labeled with `cherry-pick-completed`
+{% endfor %}
+{% else %}
+### ℹ️ No original Pull Requests were labeled.
+{% endif %}
+"""
+        template = env.from_string(template_str)
+        return template.render(config=config, labeled_prs=labeled_prs)
+    else:
+        raise ValueError(f"Unknown mode: {config.mode}")
+
+
 def main():
     mode = os.environ.get('INPUT_MODE', 'hotfix').lower()
+
+    summary = "N/A"
 
     if mode == 'completed':
         config = CherryPickConfig(
@@ -548,24 +684,7 @@ def main():
         with open(os.environ.get('GITHUB_OUTPUT', '/dev/stdout'), 'a') as f:
             f.write(f"labeled-prs={json.dumps(labeled_prs)}\n")
 
-        summary_lines = [
-            "## 🏷️ Cherry-Pick Completed Labeler Summary",
-            "",
-            f"Processed hotfix PR #{config.pr_number}",
-            ""
-        ]
-
-        if labeled_prs:
-            summary_lines.append("### ✅ Labeled Pull Requests")
-            summary_lines.append("")
-            for pr_num in labeled_prs:
-                summary_lines.append(f"- PR #{pr_num} labeled with `cherry-pick-completed`")
-            summary_lines.append("")
-        else:
-            summary_lines.append("### ℹ️ No original Pull Requests were labeled.")
-            summary_lines.append("")
-
-        summary = '\n'.join(summary_lines)
+        summary = generate_summary(config, labeled_prs=labeled_prs)
     else:
         config = CherryPickConfig(
             github_token=os.environ['INPUT_GITHUB_TOKEN'],
@@ -578,51 +697,19 @@ def main():
             mode=mode
         )
 
-        automation = CherryPickAutomation(config)
+        automation = CherryPickHotfixAutomation(config)
         results = automation.run()
 
         with open(os.environ.get('GITHUB_OUTPUT', '/dev/stdout'), 'a') as f:
             f.write(f"created-prs={json.dumps(results['created_prs'])}\n")
             f.write(f"skipped-versions={json.dumps(results['skipped_versions'])}\n")
             f.write(f"accumulated-prs={json.dumps(results['accumulated_prs'])}\n")
+            f.write(f"is-noop={str(results.get('is_noop', False)).lower()}\n")
 
-        summary_lines = [
-            "## 🍒 Hotfix Cherry-Pick Summary",
-            "",
-            f"Processed hotfix cherry-pick from PR #{config.pr_number}",
-            "",
-            f"**Squash commit**: `{config.squash_sha[:7]}`",
-            ""
-        ]
-
-        if results['created_prs']:
-            summary_lines.append("### ✅ Created/Updated Hotfix PRs")
-            summary_lines.append("")
-            for pr in results['created_prs']:
-                summary_lines.append(f"- v{pr['version']}: [PR #{pr['number']}]({pr['url']})")
-            summary_lines.append("")
-
-        if results['accumulated_prs']:
-            summary_lines.append("### 📋 Accumulated PRs in Hotfix Branch")
-            summary_lines.append("")
-            for pr_num in results['accumulated_prs']:
-                summary_lines.append(f"- #{pr_num}")
-            summary_lines.append("")
-
-        if results['skipped_versions']:
-            summary_lines.append("### ⚠️ Skipped Versions")
-            summary_lines.append("")
-            for skip in results['skipped_versions']:
-                summary_lines.append(f"- v{skip['version']}: {skip['reason']}")
-            summary_lines.append("")
-
-        summary = '\n'.join(summary_lines)
+        check_and_exit(results)
+        summary = generate_summary(config, results=results)
 
     print(summary)
-
-    if mode == 'hotfix':
-        if results['has_labels'] and not results['created_prs']:
-            sys.exit(1)
 
 
 if __name__ == '__main__':
