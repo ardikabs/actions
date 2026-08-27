@@ -1,0 +1,94 @@
+name: 'Cherry-Pick Hotfix'
+description: 'Automatically cherry-pick merged PRs to maintenance branches based on labels'
+author: 'ardikabs'
+
+inputs:
+  github-token:
+    description: 'GitHub token with repo and workflow scopes (use secrets.PAT)'
+    required: true
+
+  pr-number:
+    description: 'The PR number that was merged'
+    required: true
+
+  mode:
+    description: 'The mode to run: "hotfix" or "completed"'
+    required: false
+    default: 'hotfix'
+
+  squash-sha:
+    description: 'The squash commit SHA from the merged PR'
+    required: false
+
+  pr-title:
+    description: 'The title of the merged PR'
+    required: false
+
+  pr-url:
+    description: 'The URL of the merged PR'
+    required: false
+
+  labels:
+    description: 'JSON array of labels from the PR'
+    required: false
+
+  dry-run:
+    description: 'If true, simulate the cherry-pick without creating PR'
+    required: false
+    default: 'false'
+
+  include-completed-comment:
+    description: 'If true, post a comment on original PRs when hotfix is released'
+    required: false
+    default: 'false'
+
+outputs:
+  created-prs:
+    description: 'JSON array of created PR URLs'
+    value: ${{ steps.cherry-pick.outputs.created-prs }}
+
+  skipped-versions:
+    description: 'JSON array of skipped versions due to missing branches'
+    value: ${{ steps.cherry-pick.outputs.skipped-versions }}
+
+  labeled-prs:
+    description: 'JSON array of labeled PR numbers'
+    value: ${{ steps.cherry-pick.outputs.labeled-prs }}
+
+  accumulated-prs:
+    description: 'JSON array of accumulated PR numbers in the hotfix branch'
+    value: ${{ steps.cherry-pick.outputs.accumulated-prs }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r ${{ github.action_path }}/requirements.txt
+
+    - name: Run cherry-pick automation
+      id: cherry-pick
+      shell: bash
+      env:
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_SQUASH_SHA: ${{ inputs.squash-sha }}
+        INPUT_PR_NUMBER: ${{ inputs.pr-number }}
+        INPUT_PR_TITLE: ${{ inputs.pr-title }}
+        INPUT_PR_URL: ${{ inputs.pr-url }}
+        INPUT_LABELS: ${{ inputs.labels }}
+        INPUT_DRY_RUN: ${{ inputs.dry-run }}
+        INPUT_INCLUDE_COMPLETED_COMMENT: ${{ inputs.include-completed-comment }}
+      run: |
+        python ${{ github.action_path }}/src/main.py
+
+branding:
+  icon: 'git-branch'
+  color: 'blue'

@@ -1,0 +1,4 @@
+pygithub>=2.0.0
+gitpython>=3.1.40
+pydantic>=2.0.0
+Jinja2==3.1.6
