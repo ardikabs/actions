@@ -37,6 +37,11 @@ inputs:
     required: false
     default: 'false'
 
+  include-completed-comment:
+    description: 'If true, post a comment on original PRs when hotfix is released'
+    required: false
+    default: 'false'
+
 outputs:
   created-prs:
     description: 'JSON array of created PR URLs'
@@ -80,6 +85,7 @@ runs:
         INPUT_PR_URL: ${{ inputs.pr-url }}
         INPUT_LABELS: ${{ inputs.labels }}
         INPUT_DRY_RUN: ${{ inputs.dry-run }}
+        INPUT_INCLUDE_COMPLETED_COMMENT: ${{ inputs.include-completed-comment }}
       run: |
         python ${{ github.action_path }}/src/main.py
 

@@ -12,6 +12,11 @@ from git import Repo
 from pydantic import BaseModel
 from jinja2 import Environment
 
+try:
+    from src import templates
+except ModuleNotFoundError:
+    import templates
+
 class CherryPickConfig(BaseModel):
     github_token: str
     pr_number: int
@@ -21,6 +26,7 @@ class CherryPickConfig(BaseModel):
     pr_url: Optional[str] = None
     labels: Optional[List[str]] = None
     dry_run: bool = False
+    include_completed_comment: bool = False
 
 
 @dataclass
@@ -104,19 +110,14 @@ class CherryPickHotfixAutomation:
             pr = self.get_open_pull_request(hotfix_branch, found_release_branch)
             pr_info = f" or PR #{pr.number}" if pr else ""
 
-            comment_body = (
-                f"⚠️ **Cherry-pick Conflict Alert** ⚠️\n\n"
-                f"We tried to automatically cherry-pick the squash commit `{short_sha}` "
-                f"into the hotfix branch `{hotfix_branch}` targeting `{found_release_branch}`.\n\n"
-                f"However, git reported conflicts during the cherry-pick. "
-                f"Please checkout the hotfix branch `{hotfix_branch}`{pr_info} and resolve the conflicts manually.\n\n"
-                f"```bash\n"
-                f"git fetch origin\n"
-                f"git checkout {hotfix_branch}\n"
-                f"git cherry-pick -x {self.config.squash_sha}\n"
-                f"# Resolve conflicts, add files, and commit...\n"
-                f"git push origin {hotfix_branch}\n"
-                f"```"
+            env = Environment(trim_blocks=True, lstrip_blocks=True)
+            template = env.from_string(templates.CONFLICT_COMMENT)
+            comment_body = template.render(
+                short_sha=short_sha,
+                hotfix_branch=hotfix_branch,
+                release_branch=found_release_branch,
+                pr_info=pr_info,
+                squash_sha=self.config.squash_sha
             )
 
             issue = self.gh_repo.get_issue(self.config.pr_number)
@@ -192,24 +193,12 @@ class CherryPickHotfixAutomation:
 
         hotfixes.reverse()
 
-        body_lines = [
-            f"## 🍒 Hotfix for `{release_branch}`",
-            "",
-            "This Pull Request accumulates cherry-picked hotfixes targeting the maintenance branch.",
-            "",
-            "### 📋 Accumulated Changes",
-            ""
-        ]
-        body_lines.extend(hotfixes)
-        body_lines.extend([
-            "",
-            "---",
-            "",
-            "> This PR was automatically created and is updated by the hotfix automation workflow."
-            "> Please review and merge using **Rebase and Merge** or **Merge Commit** to preserve the cherry-pick commit history for changelog and tracking tooling."
-        ])
-
-        return "\n".join(body_lines)
+        env = Environment(trim_blocks=True, lstrip_blocks=True)
+        template = env.from_string(templates.HOTFIX_PR_BODY)
+        return template.render(
+            release_branch=release_branch,
+            hotfixes=hotfixes
+        )
 
     def create_pull_request(self, target: VersionTarget, hotfix_branch: str, release_branch: str, body: str) -> Tuple[str, int]:
         title = f"chore(release): hotfix v{target.version_string}"
@@ -317,13 +306,14 @@ class CherryPickHotfixAutomation:
                     )
             else:
                 if has_conflicts:
-                    # Ensure a PR exists even if there are conflicts
                     pr_body = self.generate_pr_body(target, release_branch, hotfix_branch)
-                    pr_body = (
-                        "## ⚠️ MERGE CONFLICTS DETECTED - MANUAL RESOLUTION REQUIRED\n\n"
-                        f"Commit `{short_sha}` could not be automatically cherry-picked into `{hotfix_branch}`.\n\n"
-                        "---\n\n"
-                        f"{pr_body}")
+                    env = Environment(trim_blocks=True, lstrip_blocks=True)
+                    template = env.from_string(templates.HOTFIX_PR_BODY_CONFLICT)
+                    pr_body = template.render(
+                        short_sha=short_sha,
+                        hotfix_branch=hotfix_branch,
+                        body=pr_body
+                    )
 
                     pr = self.get_open_pull_request(hotfix_branch, release_branch)
                     if not pr:
@@ -498,6 +488,40 @@ class CherryPickCompletedAutomation:
                 print(f"Failed to add generic label to PR #{pr.number}: {e}")
         return False
 
+    def get_hotfix_version_from_branch(self, branch_name: str) -> Optional[str]:
+        match = re.match(r'hotfix/v(\d+)\.(\d+)\.x', branch_name)
+        if match:
+            return f"{match.group(1)}.{match.group(2)}"
+        return None
+
+    def get_latest_tag_for_minor(self, minor_version: str) -> Optional[str]:
+        try:
+            tags = self.gh_repo.get_tags()
+            prefix = f"v{minor_version}."
+            latest = None
+            for tag in tags:
+                if tag.name.startswith(prefix):
+                    if latest is None or tag.name > latest:
+                        latest = tag.name
+            return latest
+        except Exception as e:
+            print(f"Failed to get latest tag for v{minor_version}: {e}")
+            return None
+
+    def post_completed_comment(self, pr, version: str, hotfix_pr_url: str) -> None:
+        try:
+            env = Environment(trim_blocks=True, lstrip_blocks=True)
+            template = env.from_string(templates.COMPLETED_COMMENT)
+            comment_body = template.render(
+                version=version,
+                pr_number=self.config.pr_number,
+                hotfix_pr_url=hotfix_pr_url
+            )
+            pr.create_comment(comment_body)
+            print(f"Posted completed comment to PR #{pr.number} for version v{version}")
+        except Exception as e:
+            print(f"Failed to post completed comment to PR #{pr.number}: {e}")
+
     def run(self) -> List[int]:
         print(f"Fetching hotfix Pull Request #{self.config.pr_number}...")
         try:
@@ -505,6 +529,17 @@ class CherryPickCompletedAutomation:
         except Exception as e:
             print(f"Failed to fetch hotfix PR #{self.config.pr_number}: {e}")
             sys.exit(1)
+
+        hotfix_pr_url = hotfix_pr.html_url
+        hotfix_version = self.get_hotfix_version_from_branch(hotfix_pr.head.ref)
+
+        latest_tag_version = None
+        if self.config.include_completed_comment and hotfix_version:
+            latest_tag_version = self.get_latest_tag_for_minor(hotfix_version)
+            print(f"Latest tag for v{hotfix_version}: {latest_tag_version}" if latest_tag_version else f"No tags found for v{hotfix_version}")
+
+        comment_version = latest_tag_version or (f"v{hotfix_version}" if hotfix_version else None)
+        print(f"Hotfix version: v{hotfix_version}" if hotfix_version else "Hotfix version: not determined from branch")
 
         # Retrieve commits from the PR
         commits = hotfix_pr.get_commits()
@@ -563,6 +598,9 @@ class CherryPickCompletedAutomation:
                             except Exception as label_err:
                                 print(f"Failed to add label to PR #{pr.number}: {label_err}")
 
+                        if self.config.include_completed_comment and comment_version:
+                            self.post_completed_comment(pr, comment_version, hotfix_pr_url)
+
                         labeled_prs.append(pr.number)
                 else:
                     # Fallback search using search API if get_pulls is empty
@@ -590,6 +628,9 @@ class CherryPickCompletedAutomation:
                                 except Exception as label_err:
                                     print(f"Failed to add label to PR #{pr.number}: {label_err}")
 
+                            if hotfix_version:
+                                self.post_completed_comment(pr, hotfix_version, hotfix_pr_url)
+
                             labeled_prs.append(pr.number)
                     else:
                         print(f"Could not associate commit {sha[:7]} with any Pull Request.")
@@ -612,55 +653,10 @@ def check_and_exit(results: dict) -> None:
 def generate_summary(config, results=None, labeled_prs=None) -> str:
     env = Environment(trim_blocks=True, lstrip_blocks=True)
     if config.mode == 'hotfix':
-        template_str="""\
-## 🍒 Hotfix Cherry-Pick Summary
-
-Processed hotfix cherry-pick from PR #{{ config.pr_number }}
-
-**Squash commit**: `{{ config.squash_sha[:7] }}`
-
-{% if results.created_prs %}
-### ✅ Created/Updated Hotfix PRs
-
-{% for pr in results.created_prs %}
-- v{{ pr.version }}: [PR #{{ pr.number }}]({{ pr.url }})
-{% endfor %}
-{% endif %}
-{% if results.accumulated_prs %}
-### 📋 Accumulated PRs in Hotfix Branch
-
-{% for pr_num in results.accumulated_prs %}
-- #{{ pr_num }}
-{% endfor %}
-{% endif %}
-{% if results.skipped_versions %}
-### ⚠️ Skipped Versions
-
-{% for skip in results.skipped_versions %}
-- v{{ skip.version }}: {{ skip.reason }}
-{% endfor %}
-{% endif %}
-"""
-        template = env.from_string(template_str)
+        template = env.from_string(templates.SUMMARY_HOTFIX)
         return template.render(config=config, results=results)
-
     elif config.mode == 'completed':
-        template_str = """\
-## 🏷️ Cherry-Pick Completed Labeler Summary
-
-Processed hotfix PR #{{ config.pr_number }}
-
-{% if labeled_prs %}
-### ✅ Labeled Pull Requests
-
-{% for pr_num in labeled_prs %}
-- PR #{{ pr_num }} labeled with `cherry-pick-completed`
-{% endfor %}
-{% else %}
-### ℹ️ No original Pull Requests were labeled.
-{% endif %}
-"""
-        template = env.from_string(template_str)
+        template = env.from_string(templates.SUMMARY_COMPLETED)
         return template.render(config=config, labeled_prs=labeled_prs)
     else:
         raise ValueError(f"Unknown mode: {config.mode}")
@@ -675,7 +671,8 @@ def main():
         config = CherryPickConfig(
             github_token=os.environ['INPUT_GITHUB_TOKEN'],
             pr_number=int(os.environ['INPUT_PR_NUMBER']),
-            mode=mode
+            mode=mode,
+            include_completed_comment=os.environ.get('INPUT_INCLUDE_COMPLETED_COMMENT', 'false').lower() == 'true'
         )
 
         automation = CherryPickCompletedAutomation(config)
